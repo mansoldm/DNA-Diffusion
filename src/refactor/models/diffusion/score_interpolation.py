@@ -26,7 +26,7 @@ def predict_logits(model, x_emb_norm, x_noisy, prev_embeds, t, classes):
     return logits
 
 
-def perform_forward_pass(model, x_emb_norm, x_noisy, prev_embeds, t, classes, use_clamp: bool = False): 
+def cdcd_forward(model, x_emb_norm, x_noisy, prev_embeds, t, classes, use_clamp: bool = False): 
     logits = predict_logits(model, x_emb_norm, x_noisy, prev_embeds, t, classes)
     nucleotide_emb_norm = F.normalize(model.nucleotide_embeddings.weight, p=2, dim=-1)  # normalize across emb_dim
     emb = interpolate_embeddings(logits, nucleotide_emb_norm)
@@ -58,6 +58,7 @@ class ScoreInterpolationModel(DiffusionModel):
         use_p2_weigthing: bool = False,
         p2_gamma: float = 0.5,
         p2_k: float = 1,
+        use_clamp: bool = False
     ):
         super().__init__(
             cdcd_transformer,
@@ -82,6 +83,7 @@ class ScoreInterpolationModel(DiffusionModel):
 
         self.timesteps = timesteps
         self.p_uncond = p_uncond
+        self.use_clamp = use_clamp
 
         # self.betas = cosine_beta_schedule(timesteps=timesteps,  s=0.0001)
         self.set_noise_schedule(self.betas, self.timesteps)
@@ -170,7 +172,7 @@ class ScoreInterpolationModel(DiffusionModel):
         classes = classes.type(torch.long)
         
         fwd = partial(
-            perform_forward_pass, 
+            cdcd_forward, 
             model=model, 
             x_emb_normalized=x_emb_normalized,
             x_noisy_emb=x_noisy_emb,
@@ -202,77 +204,7 @@ class ScoreInterpolationModel(DiffusionModel):
 
 
     @torch.no_grad()
-    def sample_cdcd(
-        self,
-        shape,
-        timesteps: int,
-        classes,
-        *,
-        use_clamp: bool = False,
-        time_delta: float = 0.0,
-        cond_weight=0
-    ):        
-        model = self.model
-
-        b = shape[0]
-        embed_t = torch.randn(shape)
-
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        def predict_embeddings(x_noisy, prev_embeds, t, classes):
-            _, emb = perform_forward_pass(model, x_noisy, x_noisy, prev_embeds, t, classes, use_clamp=use_clamp)
-            return emb
-        
-        # self cond
-        prev_embeds = torch.zeros_like(embed_t)
-        
-        # from p_sample_loop
-        if classes is not None:
-            prev_embeds = prev_embeds.repeat(2, 1, 1, 1)
-
-            n_sample = classes.shape[0]
-            context_mask = torch.ones_like(classes).to(device)
-            # make 0 index unconditional
-            # double the batch
-            classes = classes.repeat(2)
-            context_mask = context_mask.repeat(2)
-            context_mask[n_sample:] = 0.0  # makes second half of batch context free
-            sampling_fn = partial(
-                self.p_sample_guided,
-                classes=classes,
-                cond_weight=cond_weight,
-                context_mask=context_mask,
-            )
-        else: 
-            sampling_fn = partial(self.p_sample)
-
-
-        images = [] # accumulate all steps
-        embed_t = torch.randn(shape, device=device) 
-        for i in tqdm(
-            reversed(range(0, timesteps)),
-            desc="sampling loop time step",
-            total=timesteps,
-        ):
-            
-            def compute_score_interpolation(embed_t, time, classes):
-                nonlocal prev_embeds
-                prev_embeds = predict_embeddings(embed_t, prev_embeds, time, classes)
-                time = time[:, None, None, None]
-                return (prev_embeds - embed_t) * (time ** 2)
-            
-            time_next = torch.full((b,), i, device=device, dtype=torch.long)
-            embed_t = sampling_fn(compute_score_interpolation, embed_t, t=time_next, t_index=i)
-
-            # project to output space
-            out = model.linear_out(embed_t)
-            out = rearrange(out, "b w s nucl -> b w nucl s")
-            out = torch.softmax(out, dim=-2)
-            images.append(out.cpu().numpy())
-        
-        return images
-
-    @torch.no_grad()
-    def p_sample(self, x, t, t_index):
+    def p_sample(self, fwd_f, x, t, t_index):
         betas_t = extract(self.betas, t, x.shape)
         sqrt_one_minus_alphas_cumprod_t = extract(self.sqrt_one_minus_alphas_cumprod, t, x.shape)
         # print (x.shape, 'x_shape')
@@ -280,7 +212,7 @@ class ScoreInterpolationModel(DiffusionModel):
 
         # Equation 11 in the paper
         # Use our model (noise predictor) to predict the mean
-        model_mean = sqrt_recip_alphas_t * (x - betas_t * self.model(x, time=t) / sqrt_one_minus_alphas_cumprod_t)
+        model_mean = sqrt_recip_alphas_t * (x - betas_t * fwd_f(x, time=t) / sqrt_one_minus_alphas_cumprod_t)
 
         if t_index == 0:
             return model_mean
@@ -325,18 +257,34 @@ class ScoreInterpolationModel(DiffusionModel):
             noise = torch.randn_like(x)
             # Algorithm 2 line 4:
             return model_mean + torch.sqrt(posterior_variance_t) * noise
+    
 
-    # Algorithm 2 but save all images:
     @torch.no_grad()
-    def p_sample_loop(self, classes, shape, cond_weight):
+    def p_sample_loop(
+        self,
+        classes,
+        shape,
+        cond_weight=0
+    ):        
+        # sample from score interpolation CDCD model
         device = next(self.model.parameters()).device
+        model = self.model
+        timesteps = self.timesteps
+        use_clamp = self.use_clamp
+
+
+        def predict_embeddings(x_noisy, prev_embeds, t, classes):
+            _, emb = cdcd_forward(model, x_noisy, x_noisy, prev_embeds, t, classes, use_clamp=use_clamp)
+            return emb
+        
 
         b = shape[0]
-        # start from pure noise (for each example in the batch)
-        image = torch.randn(shape, device=device)
-        images = []
-
+        embed_t = torch.randn(shape)
+        prev_embeds = torch.zeros_like(embed_t)
+        
         if classes is not None:
+            prev_embeds = prev_embeds.repeat(2, 1, 1, 1)
+
             n_sample = classes.shape[0]
             context_mask = torch.ones_like(classes).to(device)
             # make 0 index unconditional
@@ -350,22 +298,36 @@ class ScoreInterpolationModel(DiffusionModel):
                 cond_weight=cond_weight,
                 context_mask=context_mask,
             )
-        else:
+        else: 
             sampling_fn = partial(self.p_sample)
 
+
+        images = [] # accumulate all steps
+        embed_t = torch.randn(shape, device=device) 
         for i in tqdm(
-            reversed(range(0, self.timesteps)),
+            reversed(range(0, timesteps)),
             desc="sampling loop time step",
-            total=self.timesteps,
+            total=timesteps,
         ):
-            image = sampling_fn(
-                self.model,
-                x=image,
-                t=torch.full((b,), i, device=device, dtype=torch.long),
-                t_index=i,
-            )
-            images.append(image.cpu().numpy())
+            
+            def score_interpolation(embed_t, time, classes):
+                nonlocal prev_embeds
+                prev_embeds = predict_embeddings(embed_t, prev_embeds, time, classes)
+                time = time[:, None, None, None]
+                return (prev_embeds - embed_t) * (time ** 2)
+            
+            time_next = torch.full((b,), i, device=device, dtype=torch.long)
+            embed_t = sampling_fn(score_interpolation, embed_t, t=time_next, t_index=i)
+
+            # project to output space
+            out = model.linear_out(embed_t)
+            out = rearrange(out, "b w s nucl -> b w nucl s")
+            out = torch.softmax(out, dim=-2)
+            images.append(out.cpu().numpy())
+        
         return images
+
+
 
     @torch.no_grad()
     def sample(self, image_size, classes=None, batch_size=16, channels=3, cond_weight=0):
