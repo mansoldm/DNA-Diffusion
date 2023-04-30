@@ -125,84 +125,7 @@ class ScoreInterpolationModel(DiffusionModel):
 
         return sqrt_alphas_cumprod_t * x_start + sqrt_one_minus_alphas_cumprod_t * noise
     
-    def cdcd_loss(
-        self,
-        model, 
-        x_start, 
-        t, 
-        classes, 
-        noise=None, 
-        p_uncond=0.1, 
-        use_reparameterization_trick=True, 
-        noise_normalized_emb=True, 
-        normalize_predicted_embs=False,
-        mse_coef: float = 0.
-    ):
-        """
-        Calculate the loss conditioned and noise injected.
-        """
-        x_idx = torch.argmax(x_start, dim=2)  # onehot -> index
-        x_emb = model.nucleotide_embeddings(x_idx)  # x_emb.shape = b,c,d,s
-        x_emb_normalized = F.normalize(x_emb, p=2, dim=-2)  # L2 normalize across emb_dim
-
-        
-        device = x_start.device
-        if noise is None:
-            if use_reparameterization_trick:
-                mean = torch.zeros_like(x_emb_normalized)
-                std = torch.ones_like(x_emb_normalized)
-
-                mean = torch.mean(x_emb_normalized, dim=0, keepdim=True)
-                std = torch.mean(x_emb_normalized, dim=0, keepdim=True)
-                epsilon = torch.randn_like(mean)
-                noise = mean + std * epsilon
-
-            else:
-                noise = torch.randn_like(x_emb_normalized) #  gauss noise 
-
-        if noise_normalized_emb: 
-            x_noisy_emb = self.q_sample(x_start=x_emb_normalized, t=t, noise=noise) #this is the auto generated noise given t and Noise
-        else: 
-            x_noisy_emb = self.q_sample(x_start=x_emb, t=t, noise=noise)
-
-        context_mask = torch.bernoulli(torch.zeros(classes.shape[0]) + (1-p_uncond)).to(device)
-
-        # mask for unconditional guidance
-        classes = classes * context_mask
-        classes = classes.type(torch.long)
-        
-        fwd = partial(
-            cdcd_forward, 
-            model=model, 
-            x_emb_normalized=x_emb_normalized,
-            x_noisy_emb=x_noisy_emb,
-            t=t,
-            classes=classes
-        )
-
-        # self conditioning 
-        prev_embeds = torch.zeros_like(x_emb_normalized)
-        if random.random() > 0.5: 
-            with torch.no_grad():
-                prev_embeds = fwd(prev_embeds=prev_embeds)[1].detach()
-
-        predicted_logits, predicted_embs = fwd(prev_embeds=prev_embeds)
-
-        if normalize_predicted_embs: 
-            predicted_embs = F.normalize(predicted_embs, dim=-2)
-
-        mse_loss = F.mse_loss(predicted_embs, x_emb_normalized, reduction='mean')
-
-        predicted_logits = rearrange(predicted_logits, 'b c nucl s -> b nucl c s')
-        ce_loss = F.cross_entropy(predicted_logits, x_idx)
-
-        return dict(
-            loss=ce_loss + mse_loss * mse_coef, 
-            ce_loss=ce_loss,
-            mse_loss=mse_loss
-        )
-
-
+    
     @torch.no_grad()
     def p_sample(self, fwd_f, x, t, t_index):
         betas_t = extract(self.betas, t, x.shape)
@@ -328,7 +251,6 @@ class ScoreInterpolationModel(DiffusionModel):
         return images
 
 
-
     @torch.no_grad()
     def sample(self, image_size, classes=None, batch_size=16, channels=3, cond_weight=0):
         return self.p_sample_loop(
@@ -337,6 +259,83 @@ class ScoreInterpolationModel(DiffusionModel):
             shape=(batch_size, channels, 4, image_size),
             cond_weight=cond_weight,
         )
+
+
+    def cdcd_loss(
+        self,
+        model, 
+        x_start, 
+        t, 
+        classes, 
+        noise=None, 
+        p_uncond=0.1, 
+        use_reparameterization_trick=True, 
+        noise_normalized_emb=True, 
+        normalize_predicted_embs=False,
+        mse_coef: float = 0.
+    ):
+        """
+        Calculate the loss conditioned and noise injected.
+        """
+        x_idx = torch.argmax(x_start, dim=2)  # onehot -> index
+        x_emb = model.nucleotide_embeddings(x_idx)  # x_emb.shape = b,c,d,s
+        x_emb_normalized = F.normalize(x_emb, p=2, dim=-2)  # L2 normalize across emb_dim
+
+        
+        device = x_start.device
+        if noise is None:
+            if use_reparameterization_trick:
+                mean = torch.mean(x_emb_normalized, dim=0, keepdim=True)
+                std = torch.mean(x_emb_normalized, dim=0, keepdim=True)
+                epsilon = torch.randn_like(mean)
+                noise = mean + std * epsilon
+
+            else:
+                noise = torch.randn_like(x_emb_normalized) #  gauss noise 
+
+        if noise_normalized_emb: 
+            x_noisy_emb = self.q_sample(x_start=x_emb_normalized, t=t, noise=noise) #this is the auto generated noise given t and Noise
+        else: 
+            x_noisy_emb = self.q_sample(x_start=x_emb, t=t, noise=noise)
+
+        context_mask = torch.bernoulli(torch.zeros(classes.shape[0]) + (1-p_uncond)).to(device)
+
+        # mask for unconditional guidance
+        classes = classes * context_mask
+        classes = classes.type(torch.long)
+        
+        fwd = partial(
+            cdcd_forward, 
+            model=model, 
+            x_emb_normalized=x_emb_normalized,
+            x_noisy_emb=x_noisy_emb,
+            t=t,
+            classes=classes
+        )
+
+        # self conditioning 
+        prev_embeds = torch.zeros_like(x_emb_normalized)
+        if random.random() > 0.5: 
+            with torch.no_grad():
+                prev_embeds = fwd(prev_embeds=prev_embeds)[1].detach()
+
+        predicted_logits, predicted_embs = fwd(prev_embeds=prev_embeds)
+
+        if normalize_predicted_embs: 
+            predicted_embs = F.normalize(predicted_embs, dim=-2)
+
+        mse_loss = F.mse_loss(predicted_embs, x_emb_normalized, reduction='mean')
+
+        predicted_logits = rearrange(predicted_logits, 'b c nucl s -> b nucl c s')
+        # ce_loss = F.cross_entropy(predicted_logits, x_idx)
+        ce_loss = self.criterion(predict_logits, x_id)
+
+        return dict(
+            loss=ce_loss + mse_loss * mse_coef, 
+            ce_loss=ce_loss,
+            mse_loss=mse_loss
+        )
+
 
     def training_step(self, batch: torch.Tensor, batch_idx: int):
         x_start, condition = extract_data_from_batch(batch)
