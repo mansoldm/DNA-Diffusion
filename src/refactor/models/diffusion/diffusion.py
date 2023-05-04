@@ -5,7 +5,7 @@ from torch import nn
 from utils.ema import EMA
 
 
-class DiffusionModel(pl.LightningModule):
+class DDPM(pl.LightningModule):
     def __init__(
         self,
         unet: nn.Module,
