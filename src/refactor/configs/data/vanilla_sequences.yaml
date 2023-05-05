@@ -1,8 +1,8 @@
-_target_: "src.data.sequence_datamodule.SequenceDataModule"
+_target_: "refactor.data.sequence_datamodule.SequenceDataModule"
 data_dir: ${paths.data_dir}
 sequence_length: 200
 sequence_encoding: polar
-cell_type_transform: None
+cell_type_transform: null
 batch_size: 128
 num_workers: 0
 #pin_memory: False

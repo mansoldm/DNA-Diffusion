@@ -3,8 +3,9 @@ from functools import partial
 import torch
 import torch.nn.functional as F
 import tqdm
-from refactor.models.diffusion.diffusion import DiffusionModel
+from models.diffusion.diffusion import DiffusionModel
 from torch import nn
+from refactor.models.networks.unet_lucas import UNetLucas
 from utils.misc import extract, extract_data_from_batch, mean_flat
 from utils.schedules import (
     alpha_cosine_log_snr,
@@ -13,7 +14,7 @@ from utils.schedules import (
 )
 
 
-class DDPM(DiffusionModel):
+class DDIM(DiffusionModel):
     def __init__(
         self,
         *,
@@ -25,7 +26,7 @@ class DDPM(DiffusionModel):
         is_conditional: bool=True,
         use_fp16: bool=False,
         timesteps=50,
-        noise_schedule="linear",
+        noise_schedule="cosine",
         use_ema: bool = True,
         ema_decay: float = 0.9999,
         lr_warmup=0,
@@ -33,10 +34,7 @@ class DDPM(DiffusionModel):
         p2_gamma: float = 0.5,
         p2_k: float = 1,
         p_uncond: float = 0.1,
-        snr: float=1.,
-        beta_start=0.0001,
-        beta_end=0.9999
-        
+        snr: float=1.
     ):
         super().__init__(
             unet,
@@ -55,65 +53,27 @@ class DDPM(DiffusionModel):
             p2_gamma=p2_gamma,
             p2_k=p2_k,
             p_uncond=p_uncond,
-            snr=snr,
-            beta_start=beta_start,
-            beta_end=beta_end
+            snr=snr
         )
 
-
     @torch.no_grad()
-    def p_sample(self, x, t, t_index):
-        betas_t = extract(self.betas, t, x.shape)
-        sqrt_one_minus_alphas_cumprod_t = extract(self.sqrt_one_minus_alphas_cumprod, t, x.shape)
-        # print (x.shape, 'x_shape')
-        sqrt_recip_alphas_t = extract(self.sqrt_recip_alphas, t, x.shape)
-
-        # Equation 11 in the paper
-        # Use our model (noise predictor) to predict the mean
-        model_mean = sqrt_recip_alphas_t * (x - betas_t * self.model(x, time=t) / sqrt_one_minus_alphas_cumprod_t)
-
-        if t_index == 0:
-            return model_mean
+    def p_ddim_sample(self, model, x, t, t_index, eta=0, temp=1.0):
+        alpha_t = extract(self.alphas_cumprod, t, x.shape)
+        alpha_prev_t = extract(self.alphas_cumprod_prev, t, x.shape)
+        sigma = eta * ((1 - alpha_prev_t) / (1 - alpha_t) * (1 - alpha_t / alpha_prev_t)) ** 0.5
+        sqrt_one_minus_alphas_cumprod = extract(sqrt_one_minus_alphas_cumprod, t, x.shape)
+        pred_x0 = (x - self.sqrt_one_minus_alphas_cumprod * model(x, time=t)) / (alpha_t**0.5)
+        dir_xt = (1.0 - alpha_prev_t - sigma**2).sqrt() * model(x, time=t)
+        if sigma == 0.0:
+            noise = 0.0
         else:
-            posterior_variance_t = extract(self.posterior_variance, t, x.shape)
-            noise = torch.randn_like(x)
-            # Algorithm 2 line 4:
-            return model_mean + torch.sqrt(posterior_variance_t) * noise
+            noise = torch.randn((1, x.shape[1:]))
+        noise *= temp
 
-    @torch.no_grad()
-    def p_sample_guided(self, x, classes, t, t_index, context_mask, cond_weight=0.0):
-        # adapted from: https://openreview.net/pdf?id=qw8AKxfYbI
-        # print (classes[0])
-        batch_size = x.shape[0]
-        # double to do guidance with
-        t_double = t.repeat(2)
-        x_double = x.repeat(2, 1, 1, 1)
-        betas_t = extract(self.betas, t_double, x_double.shape)
-        sqrt_one_minus_alphas_cumprod_t = extract(self.sqrt_one_minus_alphas_cumprod, t_double, x_double.shape)
-        sqrt_recip_alphas_t = extract(self.sqrt_recip_alphas, t_double, x_double.shape)
+        x_prev = (alpha_prev_t**0.5) * pred_x0 + dir_xt + sigma * noise
 
-        # classifier free sampling interpolates between guided and non guided using `cond_weight`
-        classes_masked = classes * context_mask
-        classes_masked = classes_masked.type(torch.long)
-        # print ('class masked', classes_masked)
-        preds = self.model(x_double, time=t_double, classes=classes_masked)
-        eps1 = (1 + cond_weight) * preds[:batch_size]
-        eps2 = cond_weight * preds[batch_size:]
-        x_t = eps1 - eps2
+        return x_prev
 
-        # Equation 11 in the paper
-        # Use our model (noise predictor) to predict the mean
-        model_mean = sqrt_recip_alphas_t[:batch_size] * (
-            x - betas_t[:batch_size] * x_t / sqrt_one_minus_alphas_cumprod_t[:batch_size]
-        )
-
-        if t_index == 0:
-            return model_mean
-        else:
-            posterior_variance_t = extract(self.posterior_variance, t, x.shape)
-            noise = torch.randn_like(x)
-            # Algorithm 2 line 4:
-            return model_mean + torch.sqrt(posterior_variance_t) * noise
 
     # Algorithm 2 but save all images:
     @torch.no_grad()

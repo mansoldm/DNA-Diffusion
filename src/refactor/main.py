@@ -4,15 +4,19 @@ import sys
 from dataclasses import dataclass
 
 import hydra
-import pyrootutils
+# import pyrootutils
 import pytorch_lightning as pl
+import torch
 import wandb
 from hydra.core.config_store import ConfigStore
 from hydra.utils import get_original_cwd, instantiate, to_absolute_path
 from omegaconf import DictConfig, OmegaConf
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 
-root = pyrootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
+# root = pyrootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
+import os.path
+import sys
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 
 @dataclass
@@ -20,7 +24,7 @@ class DNADiffusionConfig:
     data: str = "vanilla_sequences"
     model: str = "dnadiffusion"
     logger: str = "wandb"
-    trainer: str = "ddp"
+    trainer: str = "default"
     callbacks: str = "default"
     paths: str = "default"
     seed: int = 42
@@ -51,11 +55,20 @@ def main(cfg: DNADiffusionConfig):
 
     pl.seed_everything(cfg.seed)
     # Check if this works
-    model = instantiate(cfg.model)
-    train_dl = instantiate(cfg.data)
-    print(train_dl)
-    return
-    val_dl = instantiate(cfg.data)
+    # model = instantiate(cfg.model)
+    datamodule = instantiate(cfg.data)
+
+    unet = instantiate(cfg.model.unet)
+    optimizer = instantiate(cfg.model.optimizer, params=unet.parameters())
+    lr_scheduler = instantiate(cfg.model.lr_scheduler, optimizer=optimizer)
+
+    model = instantiate(
+        cfg.model,
+        unet=unet, 
+        optimizer=optimizer,
+        lr_scheduler=lr_scheduler
+    )
+    
     if cfg.ckpt_path:
         model.load_from_checkpoint(cfg.ckpt_path)
 
@@ -68,13 +81,19 @@ def main(cfg: DNADiffusionConfig):
     )
     lr_monitor_callback = LearningRateMonitor(logging_interval="epoch")
 
+
+    # logger = instantiate(cfg.logger)
     trainer = pl.Trainer(
         callbacks=[model_checkpoint_callback, lr_monitor_callback],
         accelerator=cfg.trainer.accelerator,
-        devices=cfg.trainer.devices,
-        logger=cfg.logger.wandb,
+        devices=cfg.trainer.devices
     )
-    trainer.fit(model, train_dl, val_dl)
+
+    trainer.fit(
+        model, 
+        train_dataloader=datamodule.train_dataloader(),
+        val_dataloader=datamodule.val_dataloader()
+    )
 
 
 if __name__ == "__main__":

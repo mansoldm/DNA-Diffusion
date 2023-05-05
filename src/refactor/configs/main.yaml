@@ -1,9 +1,9 @@
 defaults:
     - _self_
     - data: vanilla_sequences
-    - model: dnadiffusion
+    - model: dnaddpmdiffusion
     - logger: wandb
-    - trainer: ddp
+    - trainer: default
     - callbacks: default
     - paths: default
 

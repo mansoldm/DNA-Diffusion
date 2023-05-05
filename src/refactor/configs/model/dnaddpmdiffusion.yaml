@@ -13,4 +13,4 @@ ema_decay: 0.999
 lr_warmup: 5000
 image_size:
 beta_end: 0.02
-schedule: linear
+noise_schedule: linear
