@@ -91,8 +91,7 @@ def main(cfg: DNADiffusionConfig):
 
     trainer.fit(
         model, 
-        train_dataloader=datamodule.train_dataloader(),
-        val_dataloader=datamodule.val_dataloader()
+        datamodule=datamodule
     )
 
 
