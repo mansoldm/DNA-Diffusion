@@ -4,7 +4,7 @@ min_epochs: 1
 max_epochs: 100000
 
 accelerator: gpu
-devices: 1
+devices: 2
 gradient_clip_val: 1.0
 accumulate_grad_batches: 1
 log_every_n_steps: 1

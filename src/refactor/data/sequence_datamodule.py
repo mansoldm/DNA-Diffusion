@@ -140,10 +140,10 @@ class SequenceDataModule(pl.LightningDataModule):
             self.test_chr = test_chr
 
     def prepare_data(self) -> None:
+        print("Preparing data...")
         if self.load_saved_data: 
             return 
         
-        print("Preparing data...")
         data_path = self.data_path / self.sequences_per_group_filename
         df = read_master_dataset(data_path)
         if len(self.subset_components) < 4:
@@ -174,6 +174,7 @@ class SequenceDataModule(pl.LightningDataModule):
         print("Preparing data DONE!")
 
     def setup(self, stage: str):
+        print("Setting up", stage)
         # TODO: incorporate some extra information after the split (experiement -> split -> motif -> train/test assignment)
         # WARNING: have to be able to call loading_data on the main process of accelerate/fabric bc of gimme_motifs caching dependecies
         # Creating sequence datasets unless they exist already
@@ -236,6 +237,7 @@ class SequenceDataModule(pl.LightningDataModule):
         return df_train, df_validation, df_test
 
     def train_dataloader(self):
+        print(self.datasets_per_split)
         train_dataset = self.datasets_per_split['train']
         return DataLoader(
             dataset=train_dataset,

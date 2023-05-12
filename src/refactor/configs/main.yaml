@@ -3,7 +3,7 @@ defaults:
     - data: vanilla_sequences
     - model: dnaddpmdiffusion
     - logger: wandb
-    - trainer: default
+    - trainer: ddp
     - callbacks: default
     - paths: default
 

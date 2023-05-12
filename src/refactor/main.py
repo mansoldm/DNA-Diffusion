@@ -54,6 +54,9 @@ def main(cfg: DNADiffusionConfig):
     print(f"Orig working directory    : {get_original_cwd()}")
 
     pl.seed_everything(cfg.seed)
+    if torch.cuda.is_available(): 
+        torch.set_float32_matmul_precision('high')
+
     # Check if this works
     # model = instantiate(cfg.model)
     datamodule = instantiate(cfg.data)
@@ -83,12 +86,15 @@ def main(cfg: DNADiffusionConfig):
 
 
     # logger = instantiate(cfg.logger)
-    trainer = pl.Trainer(
+    print("Building trainer...")
+    trainer: pl.Trainer = pl.Trainer(
         callbacks=[model_checkpoint_callback, lr_monitor_callback],
         accelerator=cfg.trainer.accelerator,
-        devices=cfg.trainer.devices
+        devices=cfg.trainer.devices, 
+        num_sanity_val_steps=4
     )
 
+    print("Training model...")
     trainer.fit(
         model, 
         datamodule=datamodule
