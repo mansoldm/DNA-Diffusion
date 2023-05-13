@@ -3,11 +3,7 @@ from functools import partial
 import torch
 import torch.nn.functional as F
 import tqdm
-<<<<<<< HEAD
 from refactor.models.diffusion.diffusion import DiffusionModel
-=======
-from models.diffusion.diffusion import DDPM
->>>>>>> integrate score interpolation code with DDPM
 from torch import nn
 from utils.misc import extract, extract_data_from_batch, mean_flat
 from utils.schedules import (
@@ -17,7 +13,7 @@ from utils.schedules import (
 )
 
 
-class DDPM(DDPM):
+class DDPM(DiffusionModel):
     def __init__(
         self,
         *,

@@ -9,12 +9,8 @@ from refactor.utils.schedules import cosine_beta_schedule, linear_beta_schedule,
 from utils.ema import EMA
 
 
-<<<<<<< HEAD
 
 class DiffusionModel(pl.LightningModule):
-=======
-class DDPM(pl.LightningModule):
->>>>>>> integrate score interpolation code with DDPM
     def __init__(
         self,
         unet: nn.Module,
