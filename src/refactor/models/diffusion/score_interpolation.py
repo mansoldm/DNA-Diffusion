@@ -2,14 +2,15 @@ from functools import partial
 import random
 
 from einops import rearrange, repeat
+import numpy as np
 
 import torch
 import torch.nn.functional as F
 import tqdm
-from models.diffusion.diffusion import DDPM
+from refactor.models.diffusion.diffusion import DDPM
 from torch import nn
-from utils.misc import extract, extract_data_from_batch, mean_flat
-from utils.schedules import (
+from refactor.utils.misc import extract, extract_data_from_batch, mean_flat
+from refactor.utils.schedules import (
     alpha_cosine_log_snr,
     beta_linear_log_snr,
     linear_beta_schedule,
@@ -48,7 +49,6 @@ class CDCDModel(DDPM):
         is_conditional: bool,
         p_uncond: float = 0.1,
         use_fp16: bool,
-        logdir: str,
         optimizer: torch.optim.Optimizer,
         lr_scheduler: torch.optim.lr_scheduler._LRScheduler,
         criterion: nn.Module,
@@ -58,44 +58,45 @@ class CDCDModel(DDPM):
         use_p2_weigthing: bool = False,
         p2_gamma: float = 0.5,
         p2_k: float = 1,
-        use_clamp: bool = False
+        use_clamp: bool = False,
+        use_time_warping: bool = True,
+        n_steps_threshold_time_warping: int = 10,
+        last_n_timesteps_time_warping: int = 10,
+        mse_coef: float=0.
     ):
         super().__init__(
             cdcd_transformer,
-            is_conditional,
-            use_fp16,
-            logdir,
+            image_size,
             optimizer,
             lr_scheduler,
             criterion,
+            is_conditional,
+            use_fp16,
+            timesteps,
+            noise_schedule,
             use_ema,
             ema_decay,
             lr_warmup,
+            use_p2_weigthing,
+            p2_gamma, 
+            p2_k, 
+            p_uncond
         )
-        self.image_size = image_size
 
-        if noise_schedule == "linear":
-            self.log_snr = beta_linear_log_snr
-        elif noise_schedule == "cosine":
-            self.log_snr = alpha_cosine_log_snr
-        else:
-            raise ValueError(f"invalid noise schedule {noise_schedule}")
-
-        self.timesteps = timesteps
-        self.p_uncond = p_uncond
         self.use_clamp = use_clamp
+        self.use_time_warping = use_time_warping
+        self.n_steps_time_warping = n_steps_threshold_time_warping
+        self.last_n_timesteps_time_warping = last_n_timesteps_time_warping
+        self.mse_coef = mse_coef
 
-        # self.betas = cosine_beta_schedule(timesteps=timesteps,  s=0.0001)
-        self.set_noise_schedule(self.betas, self.timesteps)
-
-        # proposed in the paper, summed to time_next
-        # as a way to fix a deficiency in self-conditioning and lower FID when the number of sampling timesteps is < 400
-
-        self.time_difference = time_difference
-
+        # for self conditioning
         self.prev_embeds = None
-            
 
+        # for time warping
+        self.epoch_losses = []
+        self.batch_t = []
+
+        
     def predict_embeddings(self, x_noisy, prev_embeds, t, classes):
         _, emb = cdcd_forward(self.model, x_noisy, x_noisy, prev_embeds, t, classes, use_clamp=self.use_clamp)
         return emb
@@ -156,7 +157,7 @@ class CDCDModel(DDPM):
             time_next = torch.full((b,), i, device=device, dtype=torch.long)
             image = sampling_fn(self.score_f, image, t=time_next, t_index=i)
 
-            # project to output space
+            # save intermediate distributions
             out = model.linear_out(image)
             out = rearrange(out, "b w s nucl -> b w nucl s")
             out = torch.softmax(out, dim=-2)
@@ -165,19 +166,8 @@ class CDCDModel(DDPM):
         return images
 
 
-    @torch.no_grad()
-    def sample(self, image_size, classes=None, batch_size=16, channels=3, cond_weight=0):
-        return self.p_sample_loop(
-            self.model,
-            classes=classes,
-            shape=(batch_size, channels, 4, image_size),
-            cond_weight=cond_weight,
-        )
-
-
     def cdcd_loss(
         self,
-        model, 
         x_start, 
         t, 
         classes, 
@@ -191,6 +181,8 @@ class CDCDModel(DDPM):
         """
         Calculate the loss conditioned and noise injected.
         """
+        model = self.model
+
         x_idx = torch.argmax(x_start, dim=2)  # onehot -> index
         x_emb = model.nucleotide_embeddings(x_idx)  # x_emb.shape = b,c,d,s
         x_emb_normalized = F.normalize(x_emb, p=2, dim=-2)  # L2 normalize across emb_dim
@@ -239,10 +231,7 @@ class CDCDModel(DDPM):
             predicted_embs = F.normalize(predicted_embs, dim=-2)
 
         mse_loss = F.mse_loss(predicted_embs, x_emb_normalized, reduction='mean')
-
         predicted_logits = rearrange(predicted_logits, 'b c nucl s -> b nucl c s')
-        
-        # ce_loss = F.cross_entropy(predicted_logits, x_idx)
         ce_loss = self.criterion(predicted_logits, x_idx)
 
         return dict(
@@ -250,33 +239,51 @@ class CDCDModel(DDPM):
             ce_loss=ce_loss,
             mse_loss=mse_loss
         )
+    
+    def sample_timestep(self, batch_size, device, step):
+        t = torch.randint(0, self.timesteps, (batch_size,), device=device).long() # sampling a t to generate t and t+1
 
+        if self.use_time_warping and step >= self.n_steps_time_warping:
+            # sort the epoch losses so that one can take the t-s with the biggest losses
+            sort_val = np.argsort(self.epoch_losses)
+            sorted_t=[self.batch_t[i] for i in sort_val]
+
+            # take the t-s for the 5 biggest losses (5 was taken as example, no extensive optimization)
+            last_n_t = sorted_t[-self.last_n_timesteps_time_warping:]
+            unnested_last_n_t = [item for sublist in last_n_t for item in sublist]
+            rand_choice = np.random.choice(unnested_last_n_t, size=x.shape[0])
+
+            # take x.shape[0] number of t-s for the 5 biggest losses
+            t_not_random = torch.tensor(rand_choice, device="cpu")
+            # pick between t generated above and t_not_random (to increase exploration, and not to get stuck
+            # in the same t-s)
+            t = np.random.choice([t.cpu().detach(), t_not_random.cpu().detach()])
+            t = t.to(device)
+
+        return t
+        
 
     def training_step(self, batch: torch.Tensor, batch_idx: int):
-        x_start, condition = extract_data_from_batch(batch)
+        x, y = batch
 
-        if noise is None:
-            noise = torch.randn_like(x_start)
-        x_noisy = self.q_sample(x_start=x_start, t=self.timesteps, noise=noise)
+        batch_size = batch.shape[0]
+        device = batch.device
+        t = self.sample_timestep(batch_size, device, batch_idx)
 
-        # calculating generic loss function, we'll add it to the class constructor once we have the code
-        # we should log more metrics at train and validation e.g. l1, l2 and other suggestions
-        if self.use_fp16:
-            with torch.cuda.amp.autocast():
-                if self.is_conditional:
-                    predicted_noise = self.model(x_noisy, self.timesteps, condition)
-                else:
-                    predicted_noise = self.model(x_noisy, self.timesteps)
-        else:
-            if self.is_conditional:
-                predicted_noise = self.model(x_noisy, self.timesteps, condition)
-            else:
-                predicted_noise = self.model(x_noisy, self.timesteps)
+        losses = self.cdcd_loss(x, t, y, p_uncond=self.p_uncond, mse_coef=self.mse_coef)
+        self.log_dict(losses, batch_size=batch_size)
 
-        loss = self.criterion(predicted_noise, noise)
-        self.log("train", loss, batch_size=batch.shape[0])
+        if self.use_time_warping:
+            # accumulate for time warping
+            loss = losses['loss']
+            self.epoch_losses.append(loss.item())
+            self.batch_t.append(list(t.cpu().detach().numpy()))
 
-        return loss
+        return losses
+
+    def on_train_epoch_end(self):
+        self.epoch_losses = []
+        self.batch_t = []
 
     def validation_step(self, batch: torch.Tensor, batch_idx: int):
         return self.inference_step(batch, batch_idx, "validation")
@@ -312,12 +319,3 @@ class CDCDModel(DDPM):
         """
 
         return predictions
-
-    def p2_weighting(self, x_t, ts, target, prediction):
-        """
-        From Perception Prioritized Training of Diffusion Models: https://arxiv.org/abs/2204.00227.
-        """
-        weight = (1 / (self.p2_k + self.snr) ** self.p2_gamma, ts, x_t.shape)
-        loss_batch = mean_flat(weight * (target - prediction) ** 2)
-        loss = torch.mean(loss_batch)
-        return loss
