@@ -70,7 +70,7 @@ class DDPM(DiffusionModel):
 
         # Equation 11 in the paper
         # Use our model (noise predictor) to predict the mean
-        model_mean = sqrt_recip_alphas_t * (x - betas_t * self.model(x, time=t) / sqrt_one_minus_alphas_cumprod_t)
+        model_mean = sqrt_recip_alphas_t * (x - betas_t * self.score_f(x, time=t) / sqrt_one_minus_alphas_cumprod_t)
 
         if t_index == 0:
             return model_mean
@@ -79,6 +79,9 @@ class DDPM(DiffusionModel):
             noise = torch.randn_like(x)
             # Algorithm 2 line 4:
             return model_mean + torch.sqrt(posterior_variance_t) * noise
+        
+    def score_f(self, *args, **kwargs): 
+        return self.model(*args, **kwargs)
 
     @torch.no_grad()
     def p_sample_guided(self, x, classes, t, t_index, context_mask, cond_weight=0.0):
@@ -96,7 +99,7 @@ class DDPM(DiffusionModel):
         classes_masked = classes * context_mask
         classes_masked = classes_masked.type(torch.long)
         # print ('class masked', classes_masked)
-        preds = self.model(x_double, time=t_double, classes=classes_masked)
+        preds = self.score_f(x_double, time=t_double, classes=classes_masked)
         eps1 = (1 + cond_weight) * preds[:batch_size]
         eps2 = cond_weight * preds[batch_size:]
         x_t = eps1 - eps2
@@ -148,7 +151,6 @@ class DDPM(DiffusionModel):
             total=self.timesteps,
         ):
             image = sampling_fn(
-                self.model,
                 x=image,
                 t=torch.full((b,), i, device=device, dtype=torch.long),
                 t_index=i,
